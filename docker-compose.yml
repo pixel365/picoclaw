@@ -11,7 +11,7 @@ services:
     profiles:
       - agent
     volumes:
-      - ./config/config.json:/home/picoclaw/.picoclaw/config.json:ro
+      - "${PICOCLAW_CONFIG_FILE:-./config/config.json}:/home/picoclaw/.picoclaw/config.json:ro"
       - picoclaw-workspace:/home/picoclaw/.picoclaw/workspace
     entrypoint: ["picoclaw", "agent"]
     stdin_open: true
@@ -31,7 +31,7 @@ services:
       - gateway
     volumes:
       # Configuration file
-      - ./config/config.json:/home/picoclaw/.picoclaw/config.json:ro
+      - "${PICOCLAW_CONFIG_FILE:-./config/config.json}:/home/picoclaw/.picoclaw/config.json:ro"
       # Persistent workspace (sessions, memory, logs)
       - picoclaw-workspace:/home/picoclaw/.picoclaw/workspace
     command: ["gateway"]
