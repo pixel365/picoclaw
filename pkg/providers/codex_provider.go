@@ -91,8 +91,8 @@ func (p *CodexProvider) Chat(ctx context.Context, messages []Message, tools []To
 		if evt.Type == "response.completed" || evt.Type == "response.failed" || evt.Type == "response.incomplete" {
 			evtResp := evt.Response
 			if evtResp.ID != "" {
-				copy := evtResp
-				resp = &copy
+				cp := evtResp
+				resp = &cp
 			}
 		}
 	}
