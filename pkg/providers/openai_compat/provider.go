@@ -15,21 +15,30 @@ import (
 	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
 
-type ToolCall = protocoltypes.ToolCall
-type FunctionCall = protocoltypes.FunctionCall
-type LLMResponse = protocoltypes.LLMResponse
-type UsageInfo = protocoltypes.UsageInfo
-type Message = protocoltypes.Message
-type ToolDefinition = protocoltypes.ToolDefinition
-type ToolFunctionDefinition = protocoltypes.ToolFunctionDefinition
+type (
+	ToolCall               = protocoltypes.ToolCall
+	FunctionCall           = protocoltypes.FunctionCall
+	LLMResponse            = protocoltypes.LLMResponse
+	UsageInfo              = protocoltypes.UsageInfo
+	Message                = protocoltypes.Message
+	ToolDefinition         = protocoltypes.ToolDefinition
+	ToolFunctionDefinition = protocoltypes.ToolFunctionDefinition
+	ExtraContent           = protocoltypes.ExtraContent
+	GoogleExtra            = protocoltypes.GoogleExtra
+)
 
 type Provider struct {
-	apiKey     string
-	apiBase    string
-	httpClient *http.Client
+	apiKey         string
+	apiBase        string
+	maxTokensField string // Field name for max tokens (e.g., "max_completion_tokens" for o1/glm models)
+	httpClient     *http.Client
 }
 
 func NewProvider(apiKey, apiBase, proxy string) *Provider {
+	return NewProviderWithMaxTokensField(apiKey, apiBase, proxy, "")
+}
+
+func NewProviderWithMaxTokensField(apiKey, apiBase, proxy, maxTokensField string) *Provider {
 	client := &http.Client{
 		Timeout: 120 * time.Second,
 	}
@@ -46,22 +55,29 @@ func NewProvider(apiKey, apiBase, proxy string) *Provider {
 	}
 
 	return &Provider{
-		apiKey:     apiKey,
-		apiBase:    strings.TrimRight(apiBase, "/"),
-		httpClient: client,
+		apiKey:         apiKey,
+		apiBase:        strings.TrimRight(apiBase, "/"),
+		maxTokensField: maxTokensField,
+		httpClient:     client,
 	}
 }
 
-func (p *Provider) Chat(ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]interface{}) (*LLMResponse, error) {
+func (p *Provider) Chat(
+	ctx context.Context,
+	messages []Message,
+	tools []ToolDefinition,
+	model string,
+	options map[string]any,
+) (*LLMResponse, error) {
 	if p.apiBase == "" {
 		return nil, fmt.Errorf("API base not configured")
 	}
 
 	model = normalizeModel(model, p.apiBase)
 
-	requestBody := map[string]interface{}{
+	requestBody := map[string]any{
 		"model":    model,
-		"messages": messages,
+		"messages": stripSystemParts(messages),
 	}
 
 	if len(tools) > 0 {
@@ -70,12 +86,19 @@ func (p *Provider) Chat(ctx context.Context, messages []Message, tools []ToolDef
 	}
 
 	if maxTokens, ok := asInt(options["max_tokens"]); ok {
-		lowerModel := strings.ToLower(model)
-		if strings.Contains(lowerModel, "glm") || strings.Contains(lowerModel, "o1") || strings.Contains(lowerModel, "gpt-5") {
-			requestBody["max_completion_tokens"] = maxTokens
-		} else {
-			requestBody["max_tokens"] = maxTokens
+		// Use configured maxTokensField if specified, otherwise fallback to model-based detection
+		fieldName := p.maxTokensField
+		if fieldName == "" {
+			// Fallback: detect from model name for backward compatibility
+			lowerModel := strings.ToLower(model)
+			if strings.Contains(lowerModel, "glm") || strings.Contains(lowerModel, "o1") ||
+				strings.Contains(lowerModel, "gpt-5") {
+				fieldName = "max_completion_tokens"
+			} else {
+				fieldName = "max_tokens"
+			}
 		}
+		requestBody[fieldName] = maxTokens
 	}
 
 	if temperature, ok := asFloat(options["temperature"]); ok {
@@ -85,6 +108,18 @@ func (p *Provider) Chat(ctx context.Context, messages []Message, tools []ToolDef
 			requestBody["temperature"] = 1.0
 		} else {
 			requestBody["temperature"] = temperature
+		}
+	}
+
+	// Prompt caching: pass a stable cache key so OpenAI can bucket requests
+	// with the same key and reuse prefix KV cache across calls.
+	// The key is typically the agent ID — stable per agent, shared across requests.
+	// See: https://platform.openai.com/docs/guides/prompt-caching
+	// Prompt caching is only supported by OpenAI-native endpoints.
+	// Gemini and other providers reject unknown fields, so skip for non-OpenAI APIs.
+	if cacheKey, ok := options["prompt_cache_key"].(string); ok && cacheKey != "" {
+		if !strings.Contains(p.apiBase, "generativelanguage.googleapis.com") {
+			requestBody["prompt_cache_key"] = cacheKey
 		}
 	}
 
@@ -125,14 +160,20 @@ func parseResponse(body []byte) (*LLMResponse, error) {
 	var apiResponse struct {
 		Choices []struct {
 			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function *struct {
 						Name      string `json:"name"`
 						Arguments string `json:"arguments"`
 					} `json:"function"`
+					ExtraContent *struct {
+						Google *struct {
+							ThoughtSignature string `json:"thought_signature"`
+						} `json:"google"`
+					} `json:"extra_content"`
 				} `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
@@ -154,8 +195,14 @@ func parseResponse(body []byte) (*LLMResponse, error) {
 	choice := apiResponse.Choices[0]
 	toolCalls := make([]ToolCall, 0, len(choice.Message.ToolCalls))
 	for _, tc := range choice.Message.ToolCalls {
-		arguments := make(map[string]interface{})
+		arguments := make(map[string]any)
 		name := ""
+
+		// Extract thought_signature from Gemini/Google-specific extra content
+		thoughtSignature := ""
+		if tc.ExtraContent != nil && tc.ExtraContent.Google != nil {
+			thoughtSignature = tc.ExtraContent.Google.ThoughtSignature
+		}
 
 		if tc.Function != nil {
 			name = tc.Function.Name
@@ -167,19 +214,58 @@ func parseResponse(body []byte) (*LLMResponse, error) {
 			}
 		}
 
-		toolCalls = append(toolCalls, ToolCall{
-			ID:        tc.ID,
-			Name:      name,
-			Arguments: arguments,
-		})
+		// Build ToolCall with ExtraContent for Gemini 3 thought_signature persistence
+		toolCall := ToolCall{
+			ID:               tc.ID,
+			Name:             name,
+			Arguments:        arguments,
+			ThoughtSignature: thoughtSignature,
+		}
+
+		if thoughtSignature != "" {
+			toolCall.ExtraContent = &ExtraContent{
+				Google: &GoogleExtra{
+					ThoughtSignature: thoughtSignature,
+				},
+			}
+		}
+
+		toolCalls = append(toolCalls, toolCall)
 	}
 
 	return &LLMResponse{
-		Content:      choice.Message.Content,
-		ToolCalls:    toolCalls,
-		FinishReason: choice.FinishReason,
-		Usage:        apiResponse.Usage,
+		Content:          choice.Message.Content,
+		ReasoningContent: choice.Message.ReasoningContent,
+		ToolCalls:        toolCalls,
+		FinishReason:     choice.FinishReason,
+		Usage:            apiResponse.Usage,
 	}, nil
+}
+
+// openaiMessage is the wire-format message for OpenAI-compatible APIs.
+// It mirrors protocoltypes.Message but omits SystemParts, which is an
+// internal field that would be unknown to third-party endpoints.
+type openaiMessage struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// stripSystemParts converts []Message to []openaiMessage, dropping the
+// SystemParts field so it doesn't leak into the JSON payload sent to
+// OpenAI-compatible APIs (some strict endpoints reject unknown fields).
+func stripSystemParts(messages []Message) []openaiMessage {
+	out := make([]openaiMessage, len(messages))
+	for i, m := range messages {
+		out[i] = openaiMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCalls:  m.ToolCalls,
+			ToolCallID: m.ToolCallID,
+		}
+	}
+	return out
 }
 
 func normalizeModel(model, apiBase string) string {
@@ -194,14 +280,14 @@ func normalizeModel(model, apiBase string) string {
 
 	prefix := strings.ToLower(model[:idx])
 	switch prefix {
-	case "moonshot", "nvidia", "groq", "ollama", "deepseek", "google", "openrouter", "zhipu":
+	case "moonshot", "nvidia", "groq", "ollama", "deepseek", "google", "openrouter", "zhipu", "mistral":
 		return model[idx+1:]
 	default:
 		return model
 	}
 }
 
-func asInt(v interface{}) (int, bool) {
+func asInt(v any) (int, bool) {
 	switch val := v.(type) {
 	case int:
 		return val, true
@@ -216,7 +302,7 @@ func asInt(v interface{}) (int, bool) {
 	}
 }
 
-func asFloat(v interface{}) (float64, bool) {
+func asFloat(v any) (float64, bool) {
 	switch val := v.(type) {
 	case float64:
 		return val, true
