@@ -1,12 +1,10 @@
 services:
   # ─────────────────────────────────────────────
   # PicoClaw Agent (one-shot query)
-  #   docker compose run --rm picoclaw-agent -m "Hello"
+  #   docker compose -f docker/docker-compose.yml run --rm picoclaw-agent -m "Hello"
   # ─────────────────────────────────────────────
   picoclaw-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: docker.io/sipeed/picoclaw:latest
     container_name: picoclaw-agent
     profiles:
       - agent
@@ -22,14 +20,12 @@ services:
 
   # ─────────────────────────────────────────────
   # PicoClaw Gateway (Long-running Bot)
-  #   docker compose up picoclaw-gateway
+  #   docker compose -f docker/docker-compose.yml up picoclaw-gateway
   # ─────────────────────────────────────────────
   picoclaw-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: "docker.io/sipeed/picoclaw:${PICOCLAW_IMAGE_VERSION:-latest}"
     container_name: picoclaw-gateway
-    restart: unless-stopped
+    restart: on-failure
     profiles:
       - gateway
     # Uncomment to access host network; leave commented unless needed.
