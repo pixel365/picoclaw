@@ -32,6 +32,8 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 
 RUN mkdir -p /home/picoclaw && chown picoclaw:picoclaw /home/picoclaw
 
+WORKDIR /home/picoclaw
+
 # Health check
 # BusyBox (Alpine default) already provides wget, no extra package needed
 # Consider replacing with application-level health command in the future.
