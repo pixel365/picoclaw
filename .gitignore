@@ -46,3 +46,6 @@ tasks/
 dist/
 
 vendor/
+
+# Windows Application Icon/Resource
+*.syso
